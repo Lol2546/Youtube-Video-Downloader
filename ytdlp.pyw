@@ -3,7 +3,6 @@ import sys
 import json
 import re
 import requests
-import subprocess
 import tempfile
 import threading
 import time
@@ -17,7 +16,8 @@ from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLineEdit, QLabel, QListWidget,
     QRadioButton, QProgressBar, QFileDialog, QMessageBox,
-    QTextEdit, QStyledItemDelegate, QStyleOptionViewItem, QStyle, QDialog
+    QTextEdit, QStyledItemDelegate, QStyleOptionViewItem, QStyle,
+    QDialog
 )
 from PySide6.QtCore import QThread, Signal, Qt, QObject, QPoint, QTimer
 from yt_dlp import YoutubeDL
@@ -196,18 +196,24 @@ def audio_codec_family(acodec):
     return acodec
 
 def get_best_audio_format(formats):
-    """Prefer the highest quality Opus audio, then fall back to other audio."""
     audio_formats = [
         a for a in formats
         if a.get("vcodec") == "none"
         and a.get("abr")
-        and "-drc" not in a.get("format_id", "")
     ]
 
     if not audio_formats:
         return None
 
-    # Prefer Opus whenever available
+    # Never select DRC audio when a normal version exists
+    normal_audio = [
+        a for a in audio_formats
+        if "-drc" not in a.get("format_id", "")
+    ]
+
+    if normal_audio:
+        audio_formats = normal_audio
+
     opus_formats = [
         a for a in audio_formats
         if "opus" in (a.get("acodec") or "").lower()
@@ -216,7 +222,6 @@ def get_best_audio_format(formats):
     if opus_formats:
         return max(opus_formats, key=lambda x: x.get("abr", 0))
 
-    # Fallback if Opus is unavailable
     return max(audio_formats, key=lambda x: x.get("abr", 0))
 
 
@@ -231,87 +236,207 @@ def format_sample_rate(rate):
 
 # ================= DOWNLOAD THREAD =================
 class DownloadWorker(QThread):
-        progress = Signal(int, str)
-        finished = Signal()
-        error = Signal(str)
+    progress = Signal(int, str)
+    finished = Signal()
+    error = Signal(str)
 
-        def __init__(self, url, ydl_opts, download_dir, info, is_audio):
-            super().__init__()
-            self.url = url
-            self.ydl_opts = ydl_opts
-            self.download_dir = download_dir
-            self.info = info
-            self.is_audio = is_audio
-            self.pause_requested = False
-            self.cancel_requested = False
+    def __init__(
+        self,
+        url,
+        ydl_opts,
+        download_dir,
+        info,
+        is_audio,
+        video_format_id=None,
+        audio_format_id=None,
+        video_total=0,
+        audio_total=0
+    ):
+        super().__init__()
+        self.url = url
+        self.ydl_opts = ydl_opts
+        self.download_dir = download_dir
+        self.info = info
+        self.is_audio = is_audio
 
-        def cleanup_partial_files(self):
-            try:
-                for name in os.listdir(self.download_dir):
-                    if name.endswith(".part"):
-                        try:
-                            os.remove(os.path.join(self.download_dir, name))
-                        except:
-                            pass
-            except:
-                pass
+        self.video_format_id = video_format_id
+        self.audio_format_id = audio_format_id
 
-        def run(self):
-            try:
-                self.ydl_opts["progress_hooks"] = [self.hook]
+        self.video_total = video_total or 0
+        self.audio_total = audio_total or 0
 
-                opts = self.ydl_opts.copy()
-                opts.update(get_ydl_base_opts())
-                opts["quiet"] = False
+        self.video_downloaded = 0
+        self.audio_downloaded = 0
 
-                add_log("WORKER STARTED")
-                add_log(f"FORMAT: {opts.get('format')}")
+        self.pause_requested = False
+        self.cancel_requested = False
 
-                with LogYoutubeDL(opts) as ydl:
-                    add_log("STARTING DOWNLOAD")
+    def cleanup_partial_files(self):
+        try:
+            for name in os.listdir(self.download_dir):
+                if name.endswith(".part"):
+                    try:
+                        os.remove(os.path.join(self.download_dir, name))
+                    except:
+                        pass
+        except:
+            pass
 
-                    result = ydl.download([self.url])
+    def run(self):
+        try:
+            self.ydl_opts["progress_hooks"] = [self.hook]
 
-                    add_log(f"DOWNLOAD RESULT: {result}")
+            opts = self.ydl_opts.copy()
+            opts.update(get_ydl_base_opts())
+            opts["quiet"] = False
 
-                if not self.cancel_requested:
-                    self.finished.emit()
+            add_log("WORKER STARTED")
+            add_log(f"FORMAT: {opts.get('format')}")
 
-            except Exception as e:
-                add_log(f"DOWNLOAD ERROR: {repr(e)}")
+            with LogYoutubeDL(opts) as ydl:
+                add_log("STARTING DOWNLOAD")
+                result = ydl.download([self.url])
+                add_log(f"DOWNLOAD RESULT: {result}")
 
-                if self.cancel_requested:
-                    self.cleanup_partial_files()
-                else:
-                    self.error.emit(str(e))
+            if not self.cancel_requested:
+                self.finished.emit()
 
+        except Exception as e:
+            add_log(f"DOWNLOAD ERROR: {repr(e)}")
 
-
-        def hook(self, d):
-            # 🔴 CANCEL
             if self.cancel_requested:
-                raise Exception("Cancelled")
+                self.cleanup_partial_files()
+            else:
+                self.error.emit(str(e))
 
-            # ⏸ PAUSE (soft pause)
-            while self.pause_requested:
-                self.msleep(200)
+    def hook(self, d):
 
-            if d["status"] == "downloading":
-                downloaded = d.get("downloaded_bytes", 0)
-                total = d.get("total_bytes") or d.get("total_bytes_estimate")
-                speed = d.get("speed") or 0
-                eta = d.get("eta") or 0
+        # 🔴 CANCEL
+        if self.cancel_requested:
+            raise Exception("Cancelled")
 
-                percent = int(downloaded * 100 / total) if total else 0
-                eta_text = format_eta(eta)
+        # ⏸ PAUSE
+        while self.pause_requested:
+            self.msleep(200)
 
-                text = (
-                    f"{sizeof_fmt(downloaded)} / {sizeof_fmt(total)} "
-                    f"@ {sizeof_fmt(speed)}/s | ETA {eta_text}"
+        if d["status"] not in ("downloading", "finished"):
+            return
+
+        # ---------------------------------------------------------
+        # VIDEO MODE: COMBINED VIDEO + AUDIO PROGRESS
+        # ---------------------------------------------------------
+        if not self.is_audio and self.video_format_id and self.audio_format_id:
+
+            info_dict = d.get("info_dict") or {}
+
+            format_id = str(
+                info_dict.get("format_id")
+                or d.get("format_id")
+                or ""
+            )
+
+            downloaded = d.get("downloaded_bytes", 0) or 0
+            total = (
+                d.get("total_bytes")
+                or d.get("total_bytes_estimate")
+                or 0
+            )
+
+            # Update video progress
+            if format_id == str(self.video_format_id):
+
+                self.video_downloaded = downloaded
+
+                if total:
+                    self.video_total = total
+
+                if d["status"] == "finished":
+                    self.video_downloaded = self.video_total
+
+            # Update audio progress
+            elif format_id == str(self.audio_format_id):
+
+                self.audio_downloaded = downloaded
+
+                if total:
+                    self.audio_total = total
+
+                if d["status"] == "finished":
+                    self.audio_downloaded = self.audio_total
+
+            else:
+                return
+
+            # Combined total
+            combined_downloaded = (
+                self.video_downloaded +
+                self.audio_downloaded
+            )
+
+            combined_total = (
+                self.video_total +
+                self.audio_total
+            )
+
+            if combined_total:
+                percent = int(
+                    combined_downloaded * 100 / combined_total
                 )
+                percent = min(percent, 100)
+            else:
+                percent = 0
 
-                self.progress.emit(percent, text)
+            # Current download speed
+            speed = d.get("speed") or 0
 
+            # Combined ETA
+            if speed and combined_total:
+                remaining = combined_total - combined_downloaded
+                eta = int(remaining / speed)
+            else:
+                eta = 0
+
+            text = (
+                f"{sizeof_fmt(combined_downloaded)} / "
+                f"{sizeof_fmt(combined_total)} "
+                f"@ {sizeof_fmt(speed)}/s | "
+                f"ETA {format_eta(eta)}"
+            )
+
+            self.progress.emit(percent, text)
+
+            return
+
+        # ---------------------------------------------------------
+        # AUDIO MODE: EXISTING BEHAVIOR
+        # ---------------------------------------------------------
+        if d["status"] == "downloading":
+
+            downloaded = d.get("downloaded_bytes", 0)
+            total = (
+                d.get("total_bytes")
+                or d.get("total_bytes_estimate")
+            )
+
+            speed = d.get("speed") or 0
+            eta = d.get("eta") or 0
+
+            percent = (
+                int(downloaded * 100 / total)
+                if total
+                else 0
+            )
+
+            eta_text = format_eta(eta)
+
+            text = (
+                f"{sizeof_fmt(downloaded)} / "
+                f"{sizeof_fmt(total)} "
+                f"@ {sizeof_fmt(speed)}/s | "
+                f"ETA {eta_text}"
+            )
+
+            self.progress.emit(percent, text)
 
 
 class NoHoverHeaderDelegate(QStyledItemDelegate):
@@ -321,6 +446,22 @@ class NoHoverHeaderDelegate(QStyledItemDelegate):
             option.state &= ~QStyle.StateFlag.State_MouseOver
 
         super().paint(painter, option, index)
+
+class FetchFormatsWorker(QThread):
+    finished = Signal(object)
+    error = Signal(Exception)
+
+    def __init__(self, url):
+        super().__init__()
+        self.url = url
+
+    def run(self):
+        try:
+            with LogYoutubeDL(get_ydl_base_opts()) as ydl:
+                info = ydl.extract_info(self.url, download=False)
+            self.finished.emit(info)
+        except Exception as e:
+            self.error.emit(e)
 
 # ================= GUI =================
 class YTDLPGui(QWidget):
@@ -338,7 +479,7 @@ class YTDLPGui(QWidget):
         self.worker = None
         self.is_downloading = False
         self.is_paused = False
-        self.last_status_text = "Idle"
+        self.last_status_text = "Paused"
         self.current_ydl_opts = None
         self.current_url = None
         self.current_title = ""
@@ -381,7 +522,7 @@ class YTDLPGui(QWidget):
         self.list_widget.setFont(mono)
 
         self.progress = QProgressBar()
-        self.status = QLabel("Idle")
+        self.status = QLabel("")
         status_row = QHBoxLayout()
         status_row.addWidget(self.status)
         status_row.addStretch()
@@ -418,6 +559,7 @@ class YTDLPGui(QWidget):
 
         self.info = None
         self.formats = []
+        self.fetch_worker = None
 
     def check_for_updates(self):
         try:
@@ -430,11 +572,33 @@ class YTDLPGui(QWidget):
             if tuple(map(int, latest_version.split("."))) > tuple(map(int, CURRENT_VERSION.split("."))):
                 self.show_update_prompt(latest_version, release_data)
             else:
-                QMessageBox.information(
-                    self,
-                    "No Update Found",
-                    f"Your program is up to date.\nCurrent version: v{CURRENT_VERSION}"
+                msg = QDialog(self)
+                msg.setWindowTitle("No Update Found")
+                msg.setFixedSize(200, 110)
+
+                layout = QVBoxLayout(msg)
+
+                line1 = QLabel("Your program is up to date")
+                line1.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+                line2 = QLabel(f"Current version: v{CURRENT_VERSION}")
+                line2.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+                ok_button = QPushButton("OK")
+                ok_button.setFixedWidth(80)
+                ok_button.clicked.connect(msg.accept)
+
+                layout.addStretch()
+                layout.addWidget(line1)
+                layout.addWidget(line2)
+                layout.addSpacing(15)
+                layout.addWidget(
+                    ok_button,
+                    alignment=Qt.AlignmentFlag.AlignCenter
                 )
+                layout.addStretch()
+
+                msg.exec()
 
         except Exception as e:
             QMessageBox.critical(
@@ -751,11 +915,15 @@ class YTDLPGui(QWidget):
     # ================= FETCH =================
     def fetch_formats(self):
         self.list_widget.clear()
-        
+        # Reset old download status when fetching new formats
+        self.progress.setValue(0)
+        self.status.setText("")
+
         url = self.url_input.text().strip()
-        # Remove YouTube playlist/mix parameters from a video URL
+
         if "youtube.com/watch" in url and "v=" in url:
             url = url.split("&")[0]
+
         if not url:
             QMessageBox.warning(
                 self,
@@ -764,49 +932,18 @@ class YTDLPGui(QWidget):
             )
             return
 
-        try:
-            with LogYoutubeDL(get_ydl_base_opts()) as ydl:
-                self.info = ydl.extract_info(url, download=False)
-        except FileNotFoundError:
-            QMessageBox.warning(
-                self,
-                "Cookies required",
-                "Please select cookies.txt first."
-            )
-            return
+        self.fetch_btn.setEnabled(False)
+        self.fetch_btn.setText("Fetching...")
+
+        self.fetch_worker = FetchFormatsWorker(url)
+        self.fetch_worker.finished.connect(self.fetch_formats_finished)
+        self.fetch_worker.error.connect(self.fetch_formats_error)
+        self.fetch_worker.start()
         
-        except Exception as e:
-            msg = clean_error_message(str(e))
-            low = msg.lower()
-
-            # ❌ Random text / invalid URL
-            if "not a valid url" in low:
-                QMessageBox.warning(
-                    self,
-                    "Invalid URL",
-                    "The text you entered is not a valid YouTube link.\n"
-                    "Please paste a full video URL and try again."
-                )
-
-            # 🔐 Cookies / login issue
-            elif "sign in" in low or "cookie" in low or "login" in low:
-                QMessageBox.warning(
-                    self,
-                    "Cookies required",
-                    "YouTube requires login.\n\n"
-                    "Your cookies.txt is missing, expired, or invalid.\n"
-                    "Please re-export and select cookies.txt again."
-                )
-
-            # ❗ Everything else
-            else:
-                QMessageBox.critical(
-                    self,
-                    "Error",
-                    msg
-                )
-
-            return
+    def fetch_formats_finished(self, info):
+        self.info = info
+        self.fetch_btn.setEnabled(True)
+        self.fetch_btn.setText("Fetch formats")
 
         formats = self.info.get("formats", [])
 
@@ -822,29 +959,46 @@ class YTDLPGui(QWidget):
                 f"{'Bitrate':^{AUDIO_BITRATE_WIDTH}} | "
                 f"{'Extension':^{AUDIO_EXTENSION_WIDTH}} | "
                 f"{'Size':^{AUDIO_SIZE_WIDTH}} |"
-            )                  
+            )
+
             header_item = self.list_widget.item(0)
-            header_item.setFlags(header_item.flags() & ~Qt.ItemIsSelectable)
-            header_item.setData(Qt.ItemDataRole.UserRole, "header")
+            header_item.setFlags(
+                header_item.flags() & ~Qt.ItemIsSelectable
+            )
+            header_item.setData(
+                Qt.ItemDataRole.UserRole,
+                "header"
+            )
 
             self.formats = [
                 f for f in formats
                 if f.get("vcodec") == "none"
                 and f.get("abr")
-                and (f.get("filesize") or f.get("filesize_approx"))
+                and "-drc" not in f.get("format_id", "")
+                and (
+                    f.get("filesize")
+                    or f.get("filesize_approx")
+                )
             ]
 
-            # Keep only the highest bitrate for each audio codec
             best_formats = {}
 
             for f in self.formats:
                 codec = audio_codec_family(f.get("acodec"))
 
-                if codec not in best_formats or f["abr"] > best_formats[codec]["abr"]:
+                if (
+                    codec not in best_formats
+                    or f["abr"] > best_formats[codec]["abr"]
+                ):
                     best_formats[codec] = f
 
             self.formats = list(best_formats.values())
-            self.formats.sort(key=lambda x: x["abr"], reverse=True)
+
+            self.formats.sort(
+                key=lambda x: x["abr"],
+                reverse=True
+            )
+
             mp3_format = {
                 "format_id": "MP3",
                 "abr": 320,
@@ -853,6 +1007,7 @@ class YTDLPGui(QWidget):
                 "filesize": None,
                 "is_mp3": True
             }
+
             self.formats.append(mp3_format)
 
             wav_format = {
@@ -863,9 +1018,11 @@ class YTDLPGui(QWidget):
                 "filesize": None,
                 "is_wav": True
             }
+
             self.formats.append(wav_format)
 
             for i, f in enumerate(self.formats, start=1):
+
                 if f.get("is_mp3"):
                     source_audio = max(
                         (
@@ -877,71 +1034,96 @@ class YTDLPGui(QWidget):
                         key=lambda x: x["abr"]
                     )
 
-                    source_size = source_audio.get("filesize") or source_audio.get("filesize_approx")
+                    source_size = (
+                        source_audio.get("filesize")
+                        or source_audio.get("filesize_approx")
+                    )
 
                     if source_size:
-                        # Estimate 320 kbps MP3 size from duration
                         duration = self.info.get("duration")
+
                         if duration:
-                            mp3_size = (320 * 1000 / 8) * duration
+                            mp3_size = (
+                                (320 * 1000 / 8) * duration
+                            )
                             size_txt = "~" + sizeof_fmt(mp3_size)
                         else:
                             size_txt = "Unknown"
                     else:
                         size_txt = "Unknown"
-                else:
-                    if f.get("is_wav"):
-                        source_audio = get_best_audio_format(self.info["formats"])
 
-                        if source_audio:
-                            # "asr" is YouTube's audio sample rate in Hz
-                            sample_rate = source_audio.get("asr")
+                elif f.get("is_wav"):
+                    source_audio = get_best_audio_format(
+                        self.info["formats"]
+                    )
 
-                            # We create the WAV as 32-bit PCM
-                            bit_depth = 16
+                    if source_audio:
+                        sample_rate = source_audio.get("asr")
+                        bit_depth = 16
 
-                            f["sample_rate"] = sample_rate
-                            f["bit_depth"] = bit_depth
+                        f["sample_rate"] = sample_rate
+                        f["bit_depth"] = bit_depth
 
-                            duration = self.info.get("duration")
+                        duration = self.info.get("duration")
 
-                            if duration and sample_rate:
-                                # Stereo WAV size estimate
-                                wav_size = sample_rate * (bit_depth / 8) * 2 * duration
-                                size_txt = "~" + sizeof_fmt(wav_size)
-                            else:
-                                size_txt = "Unknown"
+                        if duration and sample_rate:
+                            wav_size = (
+                                sample_rate
+                                * (bit_depth / 8)
+                                * 2
+                                * duration
+                            )
+                            size_txt = "~" + sizeof_fmt(wav_size)
                         else:
-                            f["sample_rate"] = None
-                            f["bit_depth"] = None
                             size_txt = "Unknown"
                     else:
-                        size = sizeof_fmt(f.get("filesize") or f.get("filesize_approx"))
-                        size_txt = size
+                        f["sample_rate"] = None
+                        f["bit_depth"] = None
+                        size_txt = "Unknown"
 
-                # Keep every audio row using exactly the same column widths
+                else:
+                    size = sizeof_fmt(
+                        f.get("filesize")
+                        or f.get("filesize_approx")
+                    )
+                    size_txt = size
+
                 if f.get("is_wav"):
                     codec = "WAV".ljust(AUDIO_CODEC_WIDTH)
-                    abr = f"{format_sample_rate(f.get('sample_rate'))}, {f.get('bit_depth')} bit".ljust(AUDIO_BITRATE_WIDTH)
+
+                    abr = (
+                        f"{format_sample_rate(f.get('sample_rate'))}, "
+                        f"{f.get('bit_depth')} bit"
+                    ).ljust(AUDIO_BITRATE_WIDTH)
+
                 else:
                     if f["acodec"].startswith("mp4a"):
-                        codec = "mp4a/AAC".ljust(AUDIO_CODEC_WIDTH)
+                        codec = "mp4a/AAC".ljust(
+                            AUDIO_CODEC_WIDTH
+                        )
                     else:
-                        codec = f"{f['acodec']}".upper().ljust(AUDIO_CODEC_WIDTH)
+                        codec = f["acodec"].upper().ljust(
+                            AUDIO_CODEC_WIDTH
+                        )
 
-                    abr = f"{f['abr']} kbps".ljust(AUDIO_BITRATE_WIDTH)
+                    abr = f"{f['abr']} kbps".ljust(
+                        AUDIO_BITRATE_WIDTH
+                    )
 
-                ext = f"{f['ext']}".ljust(AUDIO_EXTENSION_WIDTH)
-                size_txt = size_txt.strip().rjust(AUDIO_SIZE_WIDTH)
-
-                self.list_widget.addItem(
-                    f"{i:>2}. | {codec} | {abr} | {ext} | {size_txt} |"
+                ext = f["ext"].ljust(
+                    AUDIO_EXTENSION_WIDTH
                 )
 
+                size_txt = size_txt.strip().rjust(
+                    AUDIO_SIZE_WIDTH
+                )
+
+                self.list_widget.addItem(
+                    f"{i:>2}. | {codec} | {abr} | "
+                    f"{ext} | {size_txt} |"
+                )
 
         else:
-            # Show the highest FPS for each resolution + codec family.
-            # If multiple formats have the same FPS, keep the largest one.
             video_by_resolution_codec = {}
 
             for f in formats:
@@ -950,22 +1132,34 @@ class YTDLPGui(QWidget):
                     and f.get("height") is not None
                     and f["height"] >= 144
                     and f.get("fps")
-                    and (f.get("filesize") or f.get("filesize_approx"))
+                    and (
+                        f.get("filesize")
+                        or f.get("filesize_approx")
+                    )
                 ):
                     vcodec = f["vcodec"].lower()
 
                     if vcodec.startswith("av01"):
                         codec_family = "av1"
-                    elif vcodec.startswith("vp09") or vcodec.startswith("vp9"):
+                    elif (
+                        vcodec.startswith("vp09")
+                        or vcodec.startswith("vp9")
+                    ):
                         codec_family = "vp9"
-                    elif vcodec.startswith("hvc1") or vcodec.startswith("hev1"):
+                    elif (
+                        vcodec.startswith("hvc1")
+                        or vcodec.startswith("hev1")
+                    ):
                         codec_family = "h.265/hevc"
                     elif vcodec.startswith("avc1"):
                         codec_family = "h.264"
                     else:
                         codec_family = vcodec
 
-                    key = (f["height"], codec_family)
+                    key = (
+                        f["height"],
+                        codec_family
+                    )
 
                     current = video_by_resolution_codec.get(key)
 
@@ -974,15 +1168,21 @@ class YTDLPGui(QWidget):
                         or f["fps"] > current["fps"]
                         or (
                             f["fps"] == current["fps"]
-                            and (f.get("filesize") or f.get("filesize_approx"))
-                            > (current.get("filesize") or current.get("filesize_approx"))
+                            and (
+                                f.get("filesize")
+                                or f.get("filesize_approx")
+                            ) > (
+                                current.get("filesize")
+                                or current.get("filesize_approx")
+                            )
                         )
                     ):
                         video_by_resolution_codec[key] = f
 
-            video_candidates = list(video_by_resolution_codec.values())
+            video_candidates = list(
+                video_by_resolution_codec.values()
+            )
 
-            # Sort by resolution, then FPS, then codec.
             video_candidates.sort(
                 key=lambda f: (
                     f["height"],
@@ -994,21 +1194,64 @@ class YTDLPGui(QWidget):
 
             self.formats = video_candidates
 
-            for i, f in enumerate(self.formats, start=1):
-                size = sizeof_fmt(
-                    f.get("filesize") or f.get("filesize_approx")
+            for i, f in enumerate(
+                self.formats,
+                start=1
+            ):
+                video_size = (
+                    f.get("filesize")
+                    or f.get("filesize_approx")
+                    or 0
                 )
+
+                aac_audio_formats = [
+                    a for a in self.info["formats"]
+                    if a.get("vcodec") == "none"
+                    and a.get("abr")
+                    and audio_codec_family(a.get("acodec")) == "aac"
+                    and (
+                        a.get("filesize")
+                        or a.get("filesize_approx")
+                    )
+                    and "-drc" not in a.get("format_id", "")
+                ]
+
+                if aac_audio_formats:
+                    best_aac_audio = max(
+                        aac_audio_formats,
+                        key=lambda x: x["abr"]
+                    )
+
+                    audio_size = (
+                        best_aac_audio.get("filesize")
+                        or best_aac_audio.get("filesize_approx")
+                        or 0
+                    )
+                else:
+                    audio_size = 0
+
+                combined_size = video_size + audio_size
+
+                size = sizeof_fmt(combined_size)
 
                 res = f"{f['height']}p".ljust(5)
                 fps = f"{f['fps']}fps".ljust(5)
 
-                vcodec = (f.get("vcodec") or "").lower()
+                vcodec = (
+                    f.get("vcodec") or ""
+                ).lower()
 
                 if vcodec.startswith("av01"):
                     codec = "av1"
-                elif vcodec.startswith("vp09") or vcodec.startswith("vp9"):
+                elif (
+                    vcodec.startswith("vp09")
+                    or vcodec.startswith("vp9")
+                ):
                     codec = "vp9"
-                elif vcodec.startswith("hvc1") or vcodec.startswith("hev1"):
+                elif (
+                    vcodec.startswith("hvc1")
+                    or vcodec.startswith("hev1")
+                ):
                     codec = "h.265/hevc"
                 elif vcodec.startswith("avc1"):
                     codec = "h.264"
@@ -1016,12 +1259,60 @@ class YTDLPGui(QWidget):
                     codec = f["vcodec"]
 
                 container = "mp4".ljust(3)
-                size_txt = (size or "Unknown").ljust(10)
+                size_txt = (
+                    size or "Unknown"
+                ).ljust(10)
 
                 self.list_widget.addItem(
                     f"{i:>2}. {res} | {fps} | "
                     f"{codec:<5} | {container} | {size_txt}"
                 )
+
+        self.fetch_worker = None
+
+    def fetch_formats_error(self, error):
+        self.fetch_btn.setEnabled(True)
+        self.fetch_btn.setText("Fetch formats")
+        self.fetch_worker = None
+
+        if isinstance(error, FileNotFoundError):
+            QMessageBox.warning(
+                self,
+                "Cookies required",
+                "Please select cookies.txt first."
+            )
+            return
+
+        msg = clean_error_message(str(error))
+        low = msg.lower()
+
+        if "not a valid url" in low:
+            QMessageBox.warning(
+                self,
+                "Invalid URL",
+                "The text you entered is not a valid YouTube link.\n"
+                "Please paste a full video URL and try again."
+            )
+
+        elif (
+            "sign in" in low
+            or "cookie" in low
+            or "login" in low
+        ):
+            QMessageBox.warning(
+                self,
+                "Cookies required",
+                "YouTube requires login.\n\n"
+                "Your cookies.txt is missing, expired, or invalid.\n"
+                "Please re-export and select cookies.txt again."
+            )
+
+        else:
+            QMessageBox.critical(
+                self,
+                "Error",
+                msg
+            )
 
 
     # ================= DOWNLOAD CONTROL =================
@@ -1111,6 +1402,8 @@ class YTDLPGui(QWidget):
                 }
 
             else:
+                add_log(f"SELECTED AUDIO FORMAT ID: {f['format_id']}")
+                add_log(f"SELECTED AUDIO FORMAT INFO: {f}")
                 # Existing Audio behavior - unchanged
                 self.current_ydl_opts = {
                     "format": f["format_id"],
@@ -1135,8 +1428,29 @@ class YTDLPGui(QWidget):
             add_log(f"SELECTED FORMAT INFO: {f}")
             add_log(f"AUDIO FORMAT: {audio['format_id']}")
 
+            video_format_id = f["format_id"]
+            audio_format_id = audio["format_id"]
+
+            video_total = (
+                f.get("filesize")
+                or f.get("filesize_approx")
+                or 0
+            )
+
+            audio_total = (
+                audio.get("filesize")
+                or audio.get("filesize_approx")
+                or 0
+            )
+
+            combined_total = video_total + audio_total
+
+            add_log(f"VIDEO SIZE: {sizeof_fmt(video_total)}")
+            add_log(f"AUDIO SIZE: {sizeof_fmt(audio_total)}")
+            add_log(f"COMBINED SIZE: {sizeof_fmt(combined_total)}")
+
             self.current_ydl_opts = {
-                "format": f"{f['format_id']}+{audio['format_id']}",
+                "format": f"{video_format_id}+{audio_format_id}",
                 "outtmpl": outtmpl,
                 "merge_output_format": "mp4",
                 "quiet": True,
@@ -1145,10 +1459,25 @@ class YTDLPGui(QWidget):
                 }
             }
 
+        self.status.setText("Downloading...")
+        if self.audio_radio.isChecked():
+            self.start_worker()
+        else:
+            self.start_worker(
+                video_format_id,
+                audio_format_id,
+                video_total,
+                audio_total
+            )
+        
 
-        self.start_worker()
-
-    def start_worker(self):
+    def start_worker(
+    self,
+    video_format_id=None,
+    audio_format_id=None,
+    video_total=0,
+    audio_total=0
+    ):
         # 🔧 reset cancel state for NEW download
         self.was_cancelled = False
         self.allow_progress_updates = True
@@ -1158,16 +1487,22 @@ class YTDLPGui(QWidget):
             self.current_ydl_opts,
             SETTINGS["download_dir"],
             self.info,
-            self.current_is_audio
+            self.current_is_audio,
+            video_format_id,
+            audio_format_id,
+            video_total,
+            audio_total
         )
 
         self.worker.progress.connect(self.update_progress)
         self.worker.finished.connect(self.done)
         self.worker.error.connect(self.failed)
+
         self.worker.start()
 
         self.is_downloading = True
         self.is_paused = False
+
         self.download_btn.setText("Cancel")
         self.pause_btn.setText("⏸")
         self.pause_btn.setEnabled(True)
@@ -1188,7 +1523,7 @@ class YTDLPGui(QWidget):
         self.worker.pause_requested = False
         self.is_paused = False
         self.pause_btn.setText("⏸")
-
+        self.status.setText("Downloading...")
 
 
     def cancel_download(self):
@@ -1294,3 +1629,4 @@ if __name__ == "__main__":
     sys.exit(app.exec())
 
 
+        
